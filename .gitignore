@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual envs / tooling
+.venv/
+.uv/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local scratch outputs
+/out/
+/scratch/
+
+# Real boards and everything produced from them are machine-local and large
+# (a converted VCU118 is ~500 MB). Committed anchors live in assets/fixtures/.
+/assets/Test/
+*.kicad_pcb
+!assets/fixtures/*.kicad_pcb
+*.kicad_pro
+*.kicad_prl
+*.board.json.gz
+*.PcbDoc
+*.brd

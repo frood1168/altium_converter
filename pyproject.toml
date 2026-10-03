@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "altium-converter"
+dynamic = ["version"]
+description = "Translate Allegro/KiCad boards for Altium, and measure their observed design constraints"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# shapely (+ numpy) does the constraint geometry. The KiCad-side scripts need
+# none of this: they run under KiCad's own Python and stdlib only.
+dependencies = [
+    "shapely>=2.0",
+    "numpy>=1.26",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+altium-converter = "altium_converter.cli:main"
+
+[project.optional-dependencies]
+# check-layers reads a PcbDoc's OLE streams directly.
+verify = [
+    "olefile>=0.47",
+]
+test = [
+    "pytest>=8.0",
+    "olefile>=0.47",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/py/altium_converter/**",
+    "assets/fixtures/**",
+    "README.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/py/altium_converter"]
+
+[tool.hatch.version]
+path = "src/py/altium_converter/_version.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

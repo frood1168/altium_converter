@@ -1,0 +1,315 @@
+"""Text-level transforms of KiCad board files (no pcbnew).
+
+Everything here edits the s-expression text line by line, never through
+pcbnew: KiCad re-derives some values (via nets) when it saves, unrepeatably,
+so a load-edit-save moves things it was not asked to. Text rewriting leaves
+every untouched item byte-identical. Importable by both the uv package and
+the scripts that run under KiCad's own Python.
+"""
+import collections
+import os
+import re
+
+
+def raw_refdes(path):
+    """Footprint uuid -> refdes, read from the imported file's text.
+
+    KiCad 10.0.3's Allegro importer writes two Reference properties per
+    footprint: the real refdes, then "${REFERENCE}" from the assembly layer.
+    The loader keeps the last, so every footprint loads as "${REFERENCE}".
+    The first one is the truth; recover it before the board is loaded.
+    """
+    refs, uuid, ref = {}, None, None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("\t(footprint "):
+                uuid, ref = None, None
+            elif line.startswith("\t\t(uuid ") and uuid is None:
+                uuid = line.split('"')[1]
+            elif line.startswith('\t\t(property "Reference" ') and ref is None:
+                ref = line.split('"')[3]
+                if uuid and ref and not ref.startswith("${"):
+                    refs[uuid] = ref
+    return refs
+
+
+
+def raw_via_nets(path):
+    """Via uuid -> its (net "NAME") line, read from the imported file's text.
+
+    The importer gives every via a net. Loading and re-saving through pcbnew
+    re-derives the net of a via that touches only copper shapes, and not
+    repeatably: five saves of this board left 9, 11, 23, 28 and 31 vias netless.
+    The importer's text is the record; pin_via_nets writes it back.
+    """
+    nets, uuid, net, in_via = {}, None, None, False
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line == "\t(via\n":
+                in_via, uuid, net = True, None, None
+            elif in_via:
+                s = line.strip()
+                if s.startswith("(net "):
+                    net = s
+                elif s.startswith("(uuid "):
+                    uuid = s.split('"')[1]
+                elif line == "\t)\n":
+                    nets[uuid] = net
+                    in_via = False
+    return nets
+
+
+def pin_via_nets(path, nets):
+    """Rewrite each via's net line in a saved KiCad 10 file from the importer's record."""
+    tmp = path + ".tmp"
+    changed, block = 0, None
+    with open(path, encoding="utf-8") as f, open(tmp, "w", encoding="utf-8", newline="\n") as out:
+        for line in f:
+            if block is None and line == "\t(via\n":
+                block = [line]
+            elif block is not None:
+                block.append(line)
+                if line == "\t)\n":
+                    uuid = next(l.strip().split('"')[1] for l in block if l.strip().startswith("(uuid "))
+                    want = nets.get(uuid)
+                    for i, l in enumerate(block):
+                        if want and l.strip().startswith("(net ") and l.strip() != want:
+                            block[i] = l[:len(l) - len(l.lstrip("\t"))] + want + "\n"
+                            changed += 1
+                    out.writelines(block)
+                    block = None
+            else:
+                out.write(line)
+    os.replace(tmp, path)
+    return changed
+
+
+def plan_zones(path, plan):
+    """Write zone priorities and inferred nets into a saved KiCad 10 file."""
+    tmp = path + ".tmp"
+    block = None
+    with open(path, encoding="utf-8") as f, open(tmp, "w", encoding="utf-8", newline="\n") as out:
+        for line in f:
+            if block is None and line == "\t(zone\n":
+                block = [line]
+            elif block is not None:
+                block.append(line)
+                if line == "\t)\n":
+                    uuid = next(l.strip().split('"')[1] for l in block if l.startswith("\t\t(uuid "))
+                    block = [l for l in block if not l.startswith("\t\t(priority ")]
+                    at = next(i for i, l in enumerate(block) if l.startswith("\t\t(uuid "))
+                    if uuid in plan["priority"]:
+                        block.insert(at + 1, f"\t\t(priority {plan['priority'][uuid]})\n")
+                    if uuid in plan["nets"] and not any(l.startswith("\t\t(net ") for l in block):
+                        block.insert(1, f'\t\t(net "{plan["nets"][uuid]}")\n')
+                    out.writelines(block)
+                    block = None
+            else:
+                out.write(line)
+    os.replace(tmp, path)
+
+
+MAX_ARC_RADIUS_MM = 1000   # Altium's Int32 limit is ~5455 mm (1 mil = 10000 units)
+COPPER = re.compile(r'^\(layer "(F\.Cu|B\.Cu|In\d+\.Cu)"\)$')
+
+
+def arc_radius_mm(a, b, c):
+    """Radius (or centre offset, if larger) of the circle through a, b, c; inf when collinear."""
+    (ax, ay), (bx, by), (cx, cy) = a, b, c
+    d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if d == 0:
+        return float("inf")
+    ux = ((ax*ax + ay*ay) * (by - cy) + (bx*bx + by*by) * (cy - ay) + (cx*cx + cy*cy) * (ay - by)) / d
+    uy = ((ax*ax + ay*ay) * (cx - bx) + (bx*bx + by*by) * (ax - cx) + (cx*cx + cy*cy) * (bx - ax)) / d
+    return max(abs(ux), abs(uy), ((ax - ux) ** 2 + (ay - uy) ** 2) ** 0.5)
+
+
+def altium_block(block, counts, plan):
+    """Rewrite one top-level item for Altium's KiCad importer; return its lines.
+
+    Done on the text, not through pcbnew: KiCad re-derives via nets from the
+    copper they touch when it saves, so any edit-and-save of the board moves
+    via nets. Text rewriting leaves every other item exactly as written.
+
+    - Near-straight track arc -> segment. Altium derives centre and radius from
+      start/mid/end and overflows Int32 on a collinear arc, abandoning the whole
+      import ("Value was either too large or too small for an Int32", empty
+      PcbDoc). Allegro leaves sub-micron ones behind.
+    - Netted copper gr_poly -> zone on the same net and outline, with its
+      zone_plan priority. Altium's reader predates nets on graphic shapes and
+      would import no-net copper.
+    - Netless zone Allegro poured nothing into (zone_plan "empty") -> dropped.
+    """
+    head = block[0].strip()
+    fields = [l.strip() for l in block]
+    uuid_line = next((f for f in fields if f.startswith("(uuid ")), None)
+    uuid = uuid_line.split('"')[1] if uuid_line else None
+    if head == "(zone" and uuid in plan["empty"]:
+        counts["empty netless zones dropped"] += 1
+        return []
+    if head == "(arc":
+        pts = {}
+        for f in fields:
+            for key in ("start", "mid", "end"):
+                if f.startswith(f"({key} "):
+                    x, y = f[len(key) + 2:-1].split()
+                    pts[key] = (float(x), float(y))
+        if arc_radius_mm(pts["start"], pts["mid"], pts["end"]) > MAX_ARC_RADIUS_MM:
+            counts["arcs straightened"] += 1
+            return ["\t(segment"] + [l for l in block[1:] if not l.strip().startswith("(mid ")]
+    elif head == "(gr_poly":
+        layer = next((f for f in fields if f.startswith("(layer ")), "")
+        net = next((f for f in fields if f.startswith("(net ")), '(net "")')
+        if COPPER.match(layer) and net != '(net "")':
+            i = fields.index("(pts")
+            j = next(k for k in range(i + 1, len(block)) if block[k] == "\t\t)")
+            counts["copper polygons zoned"] += 1
+            return (["\t(zone", f"\t\t{net}", f"\t\t{layer}", f"\t\t{uuid_line}",
+                     f"\t\t(priority {plan['priority'][uuid]})", "\t\t(hatch edge 0.5)",
+                     "\t\t(connect_pads yes", "\t\t\t(clearance 0)", "\t\t)", "\t\t(min_thickness 0.25)",
+                     "\t\t(fill", "\t\t\t(thermal_gap 0.5)", "\t\t\t(thermal_bridge_width 0.5)", "\t\t)",
+                     "\t\t(polygon"]
+                    + ["\t" + l for l in block[i:j + 1]]
+                    + ["\t\t)", "\t)"])
+    return block
+
+
+# KiCad 6/7/8 layer numbers. KiCad 9 renumbered (copper even, technical odd);
+# Altium places items by the number in the layer table, read the old way, so a
+# KiCad 9 table scrambles the stack (In19.Cu = 40 landed on BottomOverlay).
+V6_LAYER_IDS = {"F.Cu": 0, **{f"In{i}.Cu": i for i in range(1, 31)}, "B.Cu": 31,
+                "B.Adhes": 32, "F.Adhes": 33, "B.Paste": 34, "F.Paste": 35,
+                "B.SilkS": 36, "F.SilkS": 37, "B.Mask": 38, "F.Mask": 39,
+                "Dwgs.User": 40, "Cmts.User": 41, "Eco1.User": 42, "Eco2.User": 43,
+                "Edge.Cuts": 44, "Margin": 45, "B.CrtYd": 46, "F.CrtYd": 47,
+                "B.Fab": 48, "F.Fab": 49, **{f"User.{i}": 49 + i for i in range(1, 10)}}
+LAYER_ROW = re.compile(r'^\t\t\((\d+) "([^"]+)"(.*)\)$')
+
+
+def renumber_layers(rows):
+    """Rewrite the board's layer-table rows with KiCad 6 numbers, in number order."""
+    out = []
+    for row in rows:
+        m = LAYER_ROW.match(row)
+        if not m or m.group(2) not in V6_LAYER_IDS:
+            raise RuntimeError(f"no KiCad 6 number for layer row {row.strip()}")
+        out.append((V6_LAYER_IDS[m.group(2)], f'\t\t({V6_LAYER_IDS[m.group(2)]} "{m.group(2)}"{m.group(3)})'))
+    return [row for _, row in sorted(out)]
+
+
+NET_REF = re.compile(r'^(\t+)\(net "((?:[^"\\]|\\.)*)"\)$')
+# Lines/blocks introduced after KiCad 9 (format 20241229) that it would reject.
+V10_ONLY = ("(duplicate_pad_numbers_are_jumpers ", "(covering", "(plugging", "(capping", "(filling")
+
+
+def downgrade_to_kicad9(src, dst, plan, keep_fills=True):
+    """Rewrite a KiCad 10 board as format 20241229 (KiCad 9).
+
+    Altium 26 reads KiCad up to 9; given a v10 file it imports an empty board.
+    The material difference is nets: v10 (20251028) stopped writing netcodes, so
+    every reference is (net "NAME") and there is no net table. KiCad 9 needs the
+    table and numbered references, whose form depends on the owner: pads
+    (net N "NAME"), zones (net N) (net_name "NAME"), everything else (net N).
+
+    keep_fills=False drops the zones' filled_polygon blocks (the poured copper),
+    leaving outlines to be re-poured. KiCad 10 hangs, blocked, loading a
+    20241229 file that carries fills, so only the unfilled copy can be checked
+    by loading it back.
+    """
+    dropped = V10_ONLY if keep_fills else V10_ONLY + ("(filled_polygon",)
+    names = set()
+    with open(src, encoding="utf-8") as f:
+        for line in f:
+            m = NET_REF.match(line.rstrip("\n"))
+            if m:
+                names.add(m.group(2))
+    codes = {"": 0}
+    for n in sorted(names - {""}):
+        codes[n] = len(codes)
+
+    counts = collections.Counter()
+
+    def source_lines(f):
+        """The file's lines: layer table renumbered, top-level arc / gr_poly blocks run through altium_block."""
+        block, layer_rows = None, None
+        for line in f:
+            body = line.rstrip("\n")
+            if layer_rows is not None:
+                if body == "\t)":
+                    yield from renumber_layers(layer_rows)
+                    yield body
+                    layer_rows = None
+                else:
+                    layer_rows.append(body)
+            elif body == "\t(layers":
+                layer_rows = []
+                yield body
+            elif block is None and body in ("\t(arc", "\t(gr_poly", "\t(zone"):
+                block = [body]
+            elif block is not None:
+                block.append(body)
+                if body == "\t)":
+                    yield from altium_block(block, counts, plan)
+                    block = None
+            else:
+                yield body
+
+    heads = []          # owner head at each depth
+    skip_depth = None   # inside a dropped multi-line block
+    in_setup = False
+    stroke = None       # buffered (stroke ...) block: [depth, lines]
+    with open(src, encoding="utf-8") as f, open(dst, "w", encoding="utf-8", newline="\n") as out:
+        for body in source_lines(f):
+            depth = len(body) - len(body.lstrip("\t"))
+            # Line widths live in (stroke (width W) ...) since KiCad 7; Altium's
+            # reader skips stroke and falls back to 0.254 mm. KiCad still reads
+            # the older sibling (width W), so write both.
+            if stroke is not None:
+                stroke[1].append(body)
+                if depth == stroke[0] and body.strip() == ")":
+                    width = next((l.strip() for l in stroke[1] if l.strip().startswith("(width ")), None)
+                    if width:
+                        out.write("\t" * stroke[0] + width + "\n")
+                    out.write("\n".join(stroke[1]) + "\n")
+                    stroke = None
+                continue
+            if body.strip() == "(stroke":
+                stroke = [depth, [body]]
+                continue
+            if skip_depth is not None:
+                if depth == skip_depth and body.strip() == ")":
+                    skip_depth = None
+                continue
+            stripped = body.strip()
+            if stripped.startswith(dropped):
+                if not stripped.endswith(")") or stripped.count("(") > stripped.count(")"):
+                    skip_depth = depth
+                continue
+            if depth == 1 and stripped.startswith("(version "):
+                body = "\t(version 20241229)"
+            elif depth == 1 and stripped.startswith("(generator_version "):
+                body = '\t(generator_version "9.0")'
+            m = NET_REF.match(body)
+            if m:
+                indent, name = m.groups()
+                owner = heads[depth - 1] if depth - 1 < len(heads) else ""
+                code = codes[name]
+                if owner == "pad":
+                    body = f'{indent}(net {code} "{name}")'
+                elif owner == "zone":
+                    body = f'{indent}(net {code})\n{indent}(net_name "{name}")'
+                else:
+                    body = f"{indent}(net {code})"
+            if stripped.startswith("("):
+                del heads[depth:]
+                heads.append(stripped[1:].split()[0].rstrip(")"))
+            out.write(body + "\n")
+            if depth == 1 and stripped.startswith("(setup"):
+                in_setup = True
+            elif in_setup and depth == 1 and stripped == ")":
+                in_setup = False
+                for n, code in codes.items():
+                    out.write(f'\t(net {code} "{n}")\n')
+    return len(codes), counts
+
+
