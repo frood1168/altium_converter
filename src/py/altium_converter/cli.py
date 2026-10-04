@@ -4,6 +4,7 @@ Subcommands:
     convert       Allegro .brd / other kicad-cli import / .kicad_pcb -> KiCad 10 + Altium-ready KiCad copies.
     dump          Board -> neutral geometry model (.board.json.gz) for analysis.
     constraints   Model (or board) -> observed constraints (.constraints.json + .md).
+    rules         constraints.json -> altium_drc master TOML + altium_netclass TOML.
     check-layers  Which Altium layer each KiCad layer's tracks landed on in an imported PcbDoc.
     drc           Run kicad-cli DRC (optionally re-pouring zones) to JSON.
     drc-compare   Unconnected items per net: reference DRC JSON vs candidate.
@@ -67,6 +68,33 @@ def cmd_constraints(a) -> int:
     return 0
 
 
+def cmd_rules(a) -> int:
+    from . import emit
+
+    src = Path(a.constraints)
+    c = json.loads(src.read_text(encoding="utf-8"))
+    em = emit.build(c, tol=a.tol, min_coupled=a.min_coupled)
+    stem = src.name.removesuffix(".json").removesuffix(".constraints")
+    out_dir = Path(a.out_dir or src.parent)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    board = Path(str(c.get("source") or stem)).name
+    rules_path = out_dir / f"{stem}.rules.toml"
+    nets_path = out_dir / f"{stem}.netclass.toml"
+    rules_path.write_text(emit.master_toml(em, board, datetime.date.today().isoformat()), encoding="utf-8")
+    nets_path.write_text(emit.netclass_toml(em, board), encoding="utf-8")
+    kinds: dict[str, int] = {}
+    for r in em.rules:
+        kinds[r.kind] = kinds.get(r.kind, 0) + 1
+    print(f"{len(em.rules)} rules ({', '.join(f'{k} {n}' for k, n in sorted(kinds.items()))}), "
+          f"{len(em.classes)} net classes")
+    print(f"wrote {rules_path}")
+    print(f"wrote {nets_path}")
+    if em.notes:
+        print("not carried over:")
+        print(emit.notes_text(em))
+    return 0
+
+
 def cmd_check_layers(a) -> int:
     from . import verify
 
@@ -126,6 +154,15 @@ def main(argv=None) -> int:
     s.add_argument("--stamp", action="store_true", help="name outputs <stem>-constraints-YYMMDD_HHMMSS")
     s.add_argument("--timeout", type=float, default=1800)
     s.set_defaults(fn=cmd_constraints)
+
+    s = sub.add_parser("rules", help="constraints.json -> altium_drc master TOML + altium_netclass TOML")
+    s.add_argument("constraints", help=".constraints.json from `constraints`")
+    s.add_argument("-d", "--out-dir")
+    s.add_argument("--tol", type=float, default=0.02,
+                   help="relative min/max band around observed diff-pair width and gap (default 0.02)")
+    s.add_argument("--min-coupled", type=float, default=2.0,
+                   help="ignore a pair's geometry on a layer with less coupled run than this, mm (default 2)")
+    s.set_defaults(fn=cmd_rules)
 
     s = sub.add_parser("check-layers", help="where each KiCad layer's tracks landed in an imported PcbDoc")
     s.add_argument("pcbdoc"); s.add_argument("kicad_pcb")

@@ -17,6 +17,7 @@ Allegro .brd ──kicad-cli import──▶ raw .kicad_pcb ──convert──�
  or a .kicad_pcb)                                             └─ -kicad9.kicad_pcb              (Altium, source fills kept; unverified)
 
 .kicad_pcb ──dump──▶ .board.json.gz (neutral model, mm) ──constraints──▶ .constraints.json + .md
+                                                          └──rules──▶ .rules.toml (altium_drc) + .netclass.toml (altium_netclass)
 ```
 
 Anything that loads a board through KiCad runs under **KiCad's bundled Python** (that is the only
@@ -92,3 +93,34 @@ src/py/altium_converter/
 tests/
 assets/fixtures/    small committed fixtures; assets/Test/ is local and ignored
 ```
+
+## `rules` — observed constraints into the sibling tools
+
+```powershell
+uv run altium-converter rules out\MYBOARD.constraints.json -d out\      # --tol 0.02 --min-coupled 2
+```
+
+Writes a master rules TOML (the `altium_drc` format: `master lint`, `netscope`, `workingset`, `merge`)
+and a net class TOML (`altium_netclass`). Apply the net classes **first**: the pair rules are scoped to
+them. Both carry the board's full net list (so `master lint` can tell a missing class from an unknown
+one), which means `constraints.json` must come from a build that records `nets` — re-run `constraints`.
+
+A differential pair is routed to a different width/gap per layer, and net classes are the only scope
+handle the sibling tools can create, so the class key is the exact observed geometry:
+`NC_DP_<layer>_W<width mil>_G<gap mil>`, and each rule is scoped
+`InNetClass('<class>') And OnLayer('<layer>')`. A pair using two geometries on two layers sits in two
+classes and each rule reaches only its own layer.
+
+| Rule | From | Notes |
+|---|---|---|
+| `Width_DP_*`, `DiffPairsRouting_DP_*` | per-pair, per-layer coupled width and gap | min/max = ±`--tol` of observed; geometry with < `--min-coupled` mm of coupled run is ignored |
+| `Width_<layer>`, `Width` | single-ended widths carrying ≥ 2 % of a layer's length | preferred = most common; the catch-all is last |
+| `Clearance_BGA`, `Clearance` | tightest copper-to-copper estimate, BGA fields (`InComponent(...)`) vs open board | holes and pad-to-pad samples under 20 are excluded; one generic gap, not the object matrix |
+| `RoutingVias` | through-hole styles with ≥ 10 vias | blind/buried styles are reported, not emitted |
+| `PlaneClearance` | tightest open-board antipad **from the drill** | |
+
+**Not carried:** `PolygonConnect` (the master TOML has no field for connect settings — use the report's
+table) and the per-object-pair clearance matrix. Each run prints what it left out.
+Every value is an estimate of what the router was held to; review before merging.
+⚠️ **Unverified in Altium:** that a `DiffPairsRouting` rule accepts an `InNetClass` scope (it is normally
+scoped to a differential-pair class, which the sibling tools cannot create).

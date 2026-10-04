@@ -21,7 +21,10 @@ def run(model: dict, sections=SECTIONS, progress=print) -> dict:
              f"({', '.join(r for r, _ in board.bga_regions)})")
     out = {"schema": "altium_converter.constraints/1", "source": model.get("source"),
            "generated": datetime.datetime.now().isoformat(timespec="seconds"),
-           "layers": board.layers, "bga_fields": [r for r, _ in board.bga_regions]}
+           "layers": board.layers, "bga_fields": [r for r, _ in board.bga_regions],
+           # the board's namespaces, so rules emitted from this result can be linted against them
+           "nets": [n for n in board.nets if n],
+           "components": sorted({p["ref"] for p in model["pads"] if p.get("ref")})}
     dp = diffpairs.analyse(board, progress) if "diffpairs" in sections else {"pairs": []}
     out["diffpairs"] = dp
     pair_nets = {n for p in dp["pairs"] for n in (p["p"], p["n"])}
