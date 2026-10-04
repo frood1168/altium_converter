@@ -52,7 +52,8 @@ uv run altium-converter drc-compare ref.json repour.json
 | Allegro imports carry 85 layers (assembly, dimensions, drawings) | Keep copper, silkscreen, solder/paste mask, outline | `kicad_side/convert_board.py` `strip` |
 | KiCad 10.0.3 writes each refdes then `"${REFERENCE}"`; the loader keeps the last | Restore from the raw text by footprint uuid | `kicad_text.raw_refdes` |
 | pcbnew's save re-derives via nets, **unrepeatably** (9–31 vias lost per save) | Rewrite via nets from the importer's raw text by uuid | `kicad_text.pin_via_nets` |
-| Every zone imports at priority 0: pour order arbitrary (a 2.5 V split inside a 3.3 V plane disconnects) | Priority by area, smallest first | `zone_plan` / `kicad_text.plan_zones` |
+| Every zone imports at priority 0: pour order arbitrary (a 2.5 V split inside a 3.3 V plane disconnects) | Priority by area, smallest first (KiCad only) | `zone_plan` / `kicad_text.plan_zones` |
+| **Altium ignores `(priority N)`**: it numbers its pour from zone *order in the file*, so a full-layer plane poured before the islands inside it starves them (53 polygons empty after a repour) | Altium copies write the zones smallest-first, netless last, keepouts first | `kicad_text.pour_order` |
 | Importer drops the net from some fills (VCU118 TOP/BOTTOM GND floods) | Infer from what the fill touches (≥ 95 % one net) | `zone_plan` |
 | Netless zones Allegro poured nothing into | Dropped from the Altium copies | `kicad_text.altium_block` |
 | **Altium's KiCad reader is KiCad 6-era** — KiCad 10 files import as an empty board | Down-convert to format 20241229 with a numbered net table | `kicad_text.downgrade_to_kicad9` |

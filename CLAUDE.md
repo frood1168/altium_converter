@@ -21,6 +21,9 @@ See README.md for the pipeline and the fix table. Durable notes about the *work*
 - **Altium's KiCad importer is KiCad 6-era**: unknown tokens are warnings (harmless), but layers
   are mapped by the *number* in the layer table, `stroke` is skipped, nets on `gr_poly` are
   ignored, and a collinear arc overflows Int32 and empties the whole import.
+- **Altium ignores zone `(priority N)`; its pour order is the zone order in the file.** The earlier
+  polygon wins, so write the Altium copies smallest-first (`kicad_text.pour_order`). Arc-only zone
+  outlines (no `(xy)`) import as "0 vertices" and are dropped — on the VCU118, 386 tiny GND dots.
 - Units: mm everywhere; mil only in report columns.
 
 ## Tests

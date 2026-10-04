@@ -191,3 +191,54 @@ def test_downgrade_nofill_strips_filled_polygons(board, tmp_path):
 def test_arc_radius():
     assert kt.arc_radius_mm((0, 0), (1, 1), (2, 0)) == pytest.approx(1.0)
     assert kt.arc_radius_mm((0, 0), (1, 0), (2, 0)) == float("inf")
+
+
+# ---- pour order -------------------------------------------------------------------------------
+
+def _zone(uuid, net=None, keepout=False):
+    lines = [f"{T}(zone"]
+    if net is not None:
+        lines.append(f'{T}{T}(net "{net}")')
+    lines += [f'{T}{T}(layer "F.Cu")', f'{T}{T}(uuid "{uuid}")']
+    if keepout:
+        lines += [f"{T}{T}(keepout", f"{T}{T}{T}(tracks not_allowed)", f"{T}{T})"]
+    lines += [f"{T}{T}(polygon", f"{T}{T}{T}(pts (xy 0 0) (xy 1 0) (xy 1 1))", f"{T}{T})", f"{T})"]
+    return lines
+
+
+def _order_board(tmp_path, zones):
+    head = [l for l in V10.split("\n")][: V10.split("\n").index(f"{T}(gr_line")]
+    p = tmp_path / "z.kicad_pcb"
+    p.write_text("\n".join(head + [l for z in zones for l in z] + [")", ""]), encoding="utf-8", newline="\n")
+    return p
+
+
+def _uuids(text):
+    return [b.split('(uuid "')[1].split('"')[0] for b in text.split("\t(zone\n")[1:]]
+
+
+# largest area has the lowest number (the plan's convention): plane 0, medium 1, island 2, netless 3
+ORDER_PLAN = {"priority": {"plane": 0, "medium": 1, "island": 2, "floating": 3},
+              "nets": {}, "empty": set(), "ambiguous": []}
+
+
+def test_zones_are_written_smallest_first_netless_last_keepouts_first(tmp_path):
+    zones = [_zone("floating"), _zone("plane", "GND"), _zone("fence", keepout=True),
+             _zone("island", "V2P5"), _zone("medium", "V3P3")]
+    src = _order_board(tmp_path, zones)
+    out = tmp_path / "o.kicad_pcb"
+    _, counts = kt.downgrade_to_kicad9(str(src), str(out), ORDER_PLAN)
+    text = out.read_text()
+    assert _uuids(text) == ["fence", "island", "medium", "plane", "floating"]
+    assert counts["zones written in pour order"] == 5
+    assert text.rstrip("\n").endswith(")") and text.count("\t(zone\n") == 5
+
+
+def test_pour_order_ties_keep_file_order_and_unplanned_zones_go_last_among_netted():
+    a, b, c = _zone("a", "X"), _zone("b", "X"), _zone("c", "X")      # c is not in the plan
+    ordered = kt.pour_order([c, a, b], {"priority": {"a": 5, "b": 5}})
+    assert [_zone_uuid(z) for z in ordered] == ["a", "b", "c"]
+
+
+def _zone_uuid(block):
+    return next(l.strip().split('"')[1] for l in block if l.strip().startswith("(uuid "))

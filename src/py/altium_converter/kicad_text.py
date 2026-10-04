@@ -198,6 +198,37 @@ def renumber_layers(rows):
 
 
 NET_REF = re.compile(r'^(\t+)\(net "((?:[^"\\]|\\.)*)"\)$')
+
+
+def pour_order(zones, plan):
+    """Zone blocks in the order Altium should pour them: smallest outline first, netless last.
+
+    Altium's KiCad importer numbers its pour (``POURINDEX``) from the zone ORDER in the file and ignores
+    ``(priority N)`` -- measured on the VCU118: KiCad priorities 31, 12, 30, 44, 23, 54, 18 came out as
+    consecutive pour indices. Allegro lets a split island cut out of the plane around it; in Altium the
+    earlier polygon wins, so a full-layer plane poured first starves every smaller shape inside it
+    (53 polygons lost their copper this way). ``plan["priority"]`` already ranks zones by area with the
+    largest at 0, so smallest-first is descending priority.
+
+    Keepout rule areas pour nothing and keep their place at the front. The sort is stable, so ties keep
+    file order.
+    """
+    def uuid(block):
+        return next((l.strip().split('"')[1] for l in block if l.strip().startswith("(uuid ")), None)
+
+    def netless(block):
+        for l in block:
+            m = NET_REF.match(l)
+            if m and l.startswith("\t\t(net "):
+                return m.group(2) == ""
+        return True
+
+    def key(block):
+        if any(l.strip().startswith("(keepout") for l in block):
+            return (0, False, 0)
+        return (1, netless(block), -plan["priority"].get(uuid(block), -1))
+
+    return sorted(zones, key=key)
 # Lines/blocks introduced after KiCad 9 (format 20241229) that it would reject.
 V10_ONLY = ("(duplicate_pad_numbers_are_jumpers ", "(covering", "(plugging", "(capping", "(filling")
 
@@ -231,7 +262,7 @@ def downgrade_to_kicad9(src, dst, plan, keep_fills=True):
 
     def source_lines(f):
         """The file's lines: layer table renumbered, top-level arc / gr_poly blocks run through altium_block."""
-        block, layer_rows = None, None
+        block, layer_rows, zones = None, None, []
         for line in f:
             body = line.rstrip("\n")
             if layer_rows is not None:
@@ -249,8 +280,18 @@ def downgrade_to_kicad9(src, dst, plan, keep_fills=True):
             elif block is not None:
                 block.append(body)
                 if body == "\t)":
-                    yield from altium_block(block, counts, plan)
+                    done = altium_block(block, counts, plan)
+                    if done and done[0].strip() == "(zone":
+                        zones.append(done)      # held back: written in pour order at the end
+                    else:
+                        yield from done
                     block = None
+            elif body == ")" and zones:
+                for z in pour_order(zones, plan):
+                    yield from z
+                counts["zones written in pour order"] = len(zones)
+                zones.clear()
+                yield body
             else:
                 yield body
 
