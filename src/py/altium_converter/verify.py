@@ -94,3 +94,21 @@ def drc_compare(reference: str, candidate: str) -> dict:
             "candidate": {"unconnected": sum(b.values()), "nets": len(b)},
             "worse": [{"net": n, "reference": a[n], "candidate": b[n]} for _, n in worse],
             "better": [{"net": n, "reference": a[n], "candidate": b[n]} for _, n in better]}
+
+
+def pcbdoc_copper_layer_names(pcbdoc: str, count: int) -> list[str]:
+    """Names of the `count` copper layers of a PcbDoc, in stack order.
+
+    Legacy `Board6` numbering: TOP is layer 1, BOTTOM is layer 32 and the inner layers are 2..count-1
+    -- the order an Altium import of a KiCad board keeps (`check-layers` proves it per layer)."""
+    import re
+
+    import olefile
+
+    text = olefile.OleFileIO(pcbdoc).openstream("Board6/Data").read().decode("latin-1")
+    named = {int(i): n for i, n in re.findall(r"\|LAYER(\d+)NAME=([^|]*)", text)}
+    ids = [1, *range(2, count), 32]
+    missing = [i for i in ids if i not in named]
+    if missing:
+        raise ValueError(f"{pcbdoc}: no name for copper layer id(s) {missing}")
+    return [named[i] for i in ids]

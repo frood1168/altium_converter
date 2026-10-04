@@ -117,7 +117,12 @@ def _min_rule(entries: dict, *, contains: str, kinds=None, min_n=MIN_SAMPLES) ->
     return best
 
 
-def _width_rules(c: dict, rules: list[Rule], notes: list[str]) -> None:
+def _on(layer: str, names: dict[str, str]) -> str:
+    """`OnLayer('<name>')` in the *target board's* spelling: Altium resolves it against its own stack."""
+    return f"OnLayer('{names.get(layer, layer)}')"
+
+
+def _width_rules(c: dict, rules: list[Rule], notes: list[str], names: dict[str, str]) -> None:
     widths = c.get("widths", {})
     allse: dict[float, float] = {}
     lows, highs = [], []
@@ -132,7 +137,7 @@ def _width_rules(c: dict, rules: list[Rule], notes: list[str]) -> None:
         for r in se:
             allse[r["width_mm"]] = allse.get(r["width_mm"], 0.0) + r["length_mm"]
         rules.append(Rule(
-            "Width", f"Width_{_safe(layer)}", f"OnLayer('{layer}')", "All",
+            "Width", f"Width_{_safe(layer)}", _on(layer, names), "All",
             {"minimum_width": mil_str(lo), "preferred_width": mil_str(top), "maximum_width": mil_str(hi)},
             comment=("single-ended widths carrying >=2% of this layer's non-pair length; preferred is "
                      f"the most common ({top:g} mm, {se[0]['share']:.0%}); min/max the extremes"),
@@ -163,7 +168,7 @@ def _diff_pair_classes(c: dict, tol: float, min_coupled: float):
     return groups
 
 
-def _diff_pair_rules(c: dict, em: Emission, tol: float, min_coupled: float) -> None:
+def _diff_pair_rules(c: dict, em: Emission, tol: float, min_coupled: float, names: dict[str, str]) -> None:
     groups = _diff_pair_classes(c, tol, min_coupled)
     if not groups:
         em.notes.append("no differential pairs with a measured coupled run: DiffPairsRouting / pair Width "
@@ -173,7 +178,7 @@ def _diff_pair_rules(c: dict, em: Emission, tol: float, min_coupled: float) -> N
     for (layer, w, gap), e in sorted(groups.items(), key=lambda kv: (order.get(kv[0][0], 99), -kv[1]["coupled"])):
         cls = f"NC_DP_{_safe(layer)}_W{_tag(w)}_G{_tag(gap)}"
         em.classes[cls] = sorted(e["nets"])
-        scope = f"InNetClass('{cls}') And OnLayer('{layer}')"
+        scope = f"InNetClass('{cls}') And {_on(layer, names)}"
         why = (f"{e['pairs']} pair(s), {e['coupled']:.0f} mm coupled on {layer}: width {w:g} mm, gap {gap:g} mm; "
                f"min/max are +/-{tol:.0%} of the observed value")
         em.rules.append(Rule(
@@ -255,13 +260,27 @@ def _plane_rules(c: dict, em: Emission) -> None:
                         "carry connect settings: set it from the report's 'Same-net connection style' table")
 
 
-def build(c: dict, *, tol: float = DEFAULT_TOL, min_coupled: float = MIN_COUPLED_MM) -> Emission:
-    """`constraints.json` dict -> rules, net classes, notes. Priority 1 is Altium's top."""
+def build(c: dict, *, tol: float = DEFAULT_TOL, min_coupled: float = MIN_COUPLED_MM,
+          layer_names: list[str] | None = None) -> Emission:
+    """`constraints.json` dict -> rules, net classes, notes. Priority 1 is Altium's top.
+
+    `layer_names`: the target board's copper layer names in stack order. `constraints.json` carries
+    the *source's* names (`03_SIG1`), but an Altium import renames them (KiCad's `In2.Cu`), and
+    `OnLayer('03_SIG1')` then matches nothing -- silently. Without this the scopes keep the source
+    names and a note says so."""
+    names: dict[str, str] = {}
+    if layer_names is not None:
+        if len(layer_names) != len(c.get("layers", [])):
+            raise ValueError(f"{len(layer_names)} target layer names for {len(c.get('layers', []))} copper layers")
+        names = dict(zip(c["layers"], layer_names))
     em = Emission(nets=list(c.get("nets", [])), components=list(c.get("components", [])))
+    if not names:
+        em.notes.append("OnLayer scopes use the SOURCE layer names; pass the target board's (`--layers-from`) "
+                        "or they will match nothing in Altium")
     # Emit order is priority order within a kind: pair rules (most specific scope) before the
     # per-layer and catch-all Width rules, and Clearance_BGA before the generic Clearance.
-    _diff_pair_rules(c, em, tol, min_coupled)
-    _width_rules(c, em.rules, em.notes)
+    _diff_pair_rules(c, em, tol, min_coupled, names)
+    _width_rules(c, em.rules, em.notes, names)
     _clearance_rules(c, em)
     _via_rule(c, em)
     _plane_rules(c, em)

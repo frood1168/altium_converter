@@ -98,6 +98,7 @@ assets/fixtures/    small committed fixtures; assets/Test/ is local and ignored
 
 ```powershell
 uv run altium-converter rules out\MYBOARD.constraints.json -d out\      # --tol 0.02 --min-coupled 2
+uv run --extra verify altium-converter rules out\MYBOARD.constraints.json --layers-from imported.PcbDoc
 ```
 
 Writes a master rules TOML (the `altium_drc` format: `master lint`, `netscope`, `workingset`, `merge`)
@@ -118,6 +119,11 @@ classes and each rule reaches only its own layer.
 | `Clearance_BGA`, `Clearance` | tightest copper-to-copper estimate, BGA fields (`InComponent(...)`) vs open board | holes and pad-to-pad samples under 20 are excluded; one generic gap, not the object matrix |
 | `RoutingVias` | through-hole styles with ≥ 10 vias | blind/buried styles are reported, not emitted |
 | `PlaneClearance` | tightest open-board antipad **from the drill** | |
+
+**Layer names:** `OnLayer(...)` is resolved by Altium against *its* stack, and an import renames the source's
+layers (`03_SIG1` becomes `In2.Cu`). Without `--layers-from <imported.PcbDoc>` the scopes keep the source
+names and match **nothing**, silently; the flag maps by stack order. (`altium-drc netscope` only knows
+`TOP`/`MIDn`/`BOTTOM`, so it cannot confirm stack names: its "DEAD" there means "unknown name".)
 
 **Not carried:** `PolygonConnect` (the master TOML has no field for connect settings — use the report's
 table) and the per-object-pair clearance matrix. Each run prints what it left out.

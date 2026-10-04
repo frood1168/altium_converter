@@ -73,7 +73,13 @@ def cmd_rules(a) -> int:
 
     src = Path(a.constraints)
     c = json.loads(src.read_text(encoding="utf-8"))
-    em = emit.build(c, tol=a.tol, min_coupled=a.min_coupled)
+    names = None
+    if a.layers_from:
+        from . import verify
+
+        names = verify.pcbdoc_copper_layer_names(a.layers_from, len(c["layers"]))
+        print("target layers: " + ", ".join(f"{s}->{t}" for s, t in zip(c["layers"], names)))
+    em = emit.build(c, tol=a.tol, min_coupled=a.min_coupled, layer_names=names)
     stem = src.name.removesuffix(".json").removesuffix(".constraints")
     out_dir = Path(a.out_dir or src.parent)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -162,6 +168,8 @@ def main(argv=None) -> int:
                    help="relative min/max band around observed diff-pair width and gap (default 0.02)")
     s.add_argument("--min-coupled", type=float, default=2.0,
                    help="ignore a pair's geometry on a layer with less coupled run than this, mm (default 2)")
+    s.add_argument("--layers-from", metavar="PCBDOC",
+                   help="name OnLayer scopes after this imported PcbDoc's copper layers (matched by stack order)")
     s.set_defaults(fn=cmd_rules)
 
     s = sub.add_parser("check-layers", help="where each KiCad layer's tracks landed in an imported PcbDoc")

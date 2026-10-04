@@ -158,3 +158,21 @@ def test_scopes_parse_with_altium_drcs_own_parser(em):
     for r in em.rules:
         for s in (r.scope1, r.scope2):
             assert not parse_scope(s).errors, (r.name, s)
+
+
+def test_layer_names_rename_only_the_scopes():
+    em = emit.build(constraints(), layer_names=["F.Cu", "In1.Cu", "B.Cu"])
+    # class names keep the source's spelling; the scope speaks the target board's
+    assert "NC_DP_L3_W3p9_G5p9" in em.classes
+    assert rule(em, "Width_DP_L3_W3p9_G5p9").scope1 == "InNetClass('NC_DP_L3_W3p9_G5p9') And OnLayer('In1.Cu')"
+    assert rule(em, "Width_TOP").scope1 == "OnLayer('F.Cu')"
+    assert not any("SOURCE layer names" in n for n in em.notes)
+
+
+def test_without_layer_names_the_scopes_say_so():
+    assert any("SOURCE layer names" in n for n in emit.build(constraints()).notes)
+
+
+def test_layer_names_must_match_the_copper_count():
+    with pytest.raises(ValueError):
+        emit.build(constraints(), layer_names=["F.Cu", "B.Cu"])
