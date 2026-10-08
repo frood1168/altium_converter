@@ -21,9 +21,17 @@ See README.md for the pipeline and the fix table. Durable notes about the *work*
 - **Altium's KiCad importer is KiCad 6-era**: unknown tokens are warnings (harmless), but layers
   are mapped by the *number* in the layer table, `stroke` is skipped, nets on `gr_poly` are
   ignored, and a collinear arc overflows Int32 and empties the whole import.
-- **Altium ignores zone `(priority N)`; its pour order is the zone order in the file.** The earlier
-  polygon wins, so write the Altium copies smallest-first (`kicad_text.pour_order`). Arc-only zone
-  outlines (no `(xy)`) import as "0 vertices" and are dropped — on the VCU118, 386 tiny GND dots.
+- **Altium's pour order is the zone `(priority N)`, ascending** — priority 0 gets the lowest `POURINDEX`,
+  pours first and wins: the reverse of KiCad, where the higher number wins. File order does nothing
+  (two imports written in opposite orders both ranked POURINDEX against priority at Spearman +1.0). So the
+  Altium copies carry each copper zone's `pour_order` rank as its priority (`altium_priority`). Two wrong
+  theories came before this one (file order; then file order reversed): test a cause on two inputs that
+  differ in it alone.
+- **Altium keeps only a zone outline's `(xy)` points** — arc-only outlines vanish, mixed ones lose their rounded
+  parts and the vias in them. Copper outline arcs are written as points (`linearize_outline_arcs`); KiCad 10 writes
+  an arc over five lines, so never match arcs line by line.
+- Altium reads zone `min_thickness` as *Remove necks*, and KiCad's default thermal `connect_pads` as 0.5 mm reliefs:
+  both are rewritten in the Altium copies (`ALTIUM_MIN_THICKNESS_MM`, `connect_pads yes`).
 - Units: mm everywhere; mil only in report columns.
 
 ## Tests

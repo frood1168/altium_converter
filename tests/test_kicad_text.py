@@ -1,5 +1,7 @@
 """kicad_text transforms on small synthetic KiCad 10 boards."""
 
+import collections
+import math
 from pathlib import Path
 
 import pytest
@@ -93,6 +95,7 @@ V10 = "\n".join([
     f'{T}{T}(net "GND")',
     f'{T}{T}(layer "B.Cu")',
     f'{T}{T}(uuid "zone-gnd")',
+    f"{T}{T}(min_thickness 0.25)",
     f"{T}{T}(filled_polygon",
     f"{T}{T}{T}(pts (xy 0 0))",
     f"{T}{T})",
@@ -182,6 +185,14 @@ def test_downgrade_zones_netted_polygons_and_drops_empty_zones(board, tmp_path):
     assert "(net 1)" in poly_zone and '(net_name "GND")' in poly_zone
 
 
+def test_downgrade_lowers_zone_min_thickness_so_altium_keeps_plane_webs(board, tmp_path):
+    # Altium reads min_thickness as "remove necks narrower than": 0.25 mm cut the plane under BGAs
+    text, _, counts = _downgrade(board, tmp_path)
+    assert counts["zone neck widths lowered"] == 1
+    assert "(min_thickness 0.25)" not in text
+    assert text.count("(min_thickness 0.0254)") == 2      # zone-gnd, and the zone made from gr_poly poly-1
+
+
 def test_downgrade_nofill_strips_filled_polygons(board, tmp_path):
     text, _, _ = _downgrade(board, tmp_path, keep_fills=False)
     assert "filled_polygon" not in text
@@ -222,7 +233,16 @@ ORDER_PLAN = {"priority": {"plane": 0, "medium": 1, "island": 2, "floating": 3},
               "nets": {}, "empty": set(), "ambiguous": []}
 
 
-def test_zones_are_written_smallest_first_netless_last_keepouts_first(tmp_path):
+def _priorities(text):
+    out = {}
+    for b in text.split("\t(zone\n")[1:]:
+        u = b.split('(uuid "')[1].split('"')[0]
+        out[u] = int(b.split("(priority ")[1].split(")")[0]) if "(priority " in b.split("\t)\n")[0] else None
+    return out
+
+
+def test_altium_copies_carry_the_pour_rank_as_zone_priority(tmp_path):
+    # Altium pours in ascending (priority N): the smallest island must get 0, the netless zone the last rank
     zones = [_zone("floating"), _zone("plane", "GND"), _zone("fence", keepout=True),
              _zone("island", "V2P5"), _zone("medium", "V3P3")]
     src = _order_board(tmp_path, zones)
@@ -230,8 +250,21 @@ def test_zones_are_written_smallest_first_netless_last_keepouts_first(tmp_path):
     _, counts = kt.downgrade_to_kicad9(str(src), str(out), ORDER_PLAN)
     text = out.read_text()
     assert _uuids(text) == ["fence", "island", "medium", "plane", "floating"]
-    assert counts["zones written in pour order"] == 5
+    assert _priorities(text) == {"fence": None, "island": 0, "medium": 1, "plane": 2, "floating": 3}
+    assert counts["zones written in pour order"] == 5 and counts["copper zones given their pour rank as priority"] == 4
     assert text.rstrip("\n").endswith(")") and text.count("\t(zone\n") == 5
+
+
+def test_altium_priority_replaces_an_existing_priority():
+    z = _zone("plane", "GND")
+    z.insert(z.index(f'{T}{T}(uuid "plane")') + 1, f"{T}{T}(priority 0)")
+    out = kt.altium_priority(z, 7)
+    assert [l for l in out if "(priority" in l] == [f"{T}{T}(priority 7)"]
+
+
+def test_pour_order_is_smallest_first_netless_last():
+    zones = [_zone("floating"), _zone("plane", "GND"), _zone("island", "V2P5"), _zone("medium", "V3P3")]
+    assert [_zone_uuid(z) for z in kt.pour_order(zones, ORDER_PLAN)] == ["island", "medium", "plane", "floating"]
 
 
 def test_pour_order_ties_keep_file_order_and_unplanned_zones_go_last_among_netted():
@@ -242,3 +275,54 @@ def test_pour_order_ties_keep_file_order_and_unplanned_zones_go_last_among_nette
 
 def _zone_uuid(block):
     return next(l.strip().split('"')[1] for l in block if l.strip().startswith("(uuid "))
+
+
+# ---- outline arcs and pad connection -------------------------------------------------------------
+
+NO_PLAN = {"priority": {"g": 3}, "nets": {}, "empty": set(), "ambiguous": []}
+
+
+def _pts(lines):
+    return [tuple(float(v) for v in l.strip()[4:-1].split()) for l in lines if l.strip().startswith("(xy ")]
+
+
+def _area(pts):
+    return abs(sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]))) / 2
+
+
+def test_zone_outline_arcs_become_points_and_thermal_pads_become_solid():
+    # 2 x 2 square whose right side is a half disc of radius 1 (KiCad 10 writes arcs over five lines)
+    block = [f"{T}(zone", f'{T}{T}(net "GND")', f'{T}{T}(layer "F.Cu")', f'{T}{T}(uuid "z")',
+             f"{T}{T}(connect_pads", f"{T}{T}{T}(clearance 0.5)", f"{T}{T})",
+             f"{T}{T}(polygon", f"{T}{T}{T}(pts", f"{T}{T}{T}{T}(xy 0 0)", f"{T}{T}{T}{T}(xy 2 0)",
+             f"{T}{T}{T}{T}(arc", f"{T}{T}{T}{T}{T}(start 2 0)", f"{T}{T}{T}{T}{T}(mid 3 1)", f"{T}{T}{T}{T}{T}(end 2 2)",
+             f"{T}{T}{T}{T})", f"{T}{T}{T}{T}(xy 0 2)", f"{T}{T}{T})", f"{T}{T})", f"{T})"]
+    counts = collections.Counter()
+    out = kt.altium_block(block, counts, NO_PLAN)
+    assert not any(l.strip().startswith(("(arc", "(start", "(mid", "(end")) for l in out)
+    pts = _pts(out)
+    assert _area(pts) == pytest.approx(4 + math.pi / 2, abs=0.01)       # the half disc is kept, not cut off
+    assert pts.count((2.0, 0.0)) == 1                                     # shared end not repeated
+    assert max(x for x, _ in pts) == pytest.approx(3.0, abs=0.003)       # the arc's far side survives
+    assert f"{T}{T}(connect_pads yes" in out and counts["zone pad connections made solid"] == 1
+    assert counts["outline arcs written as points"] == 1
+
+
+def test_zoned_gr_poly_full_circle_becomes_a_polygon():
+    # Altium drops an arc-only outline entirely ("Zone with 0 vertices"); 372 VCU118 GND dots each held a via
+    block = [f"{T}(gr_poly", f"{T}{T}(pts", f"{T}{T}{T}(arc", f"{T}{T}{T}{T}(start 1 0)", f"{T}{T}{T}{T}(mid -1 0)",
+             f"{T}{T}{T}{T}(end 1 0)", f"{T}{T}{T})", f"{T}{T})", f'{T}{T}(layer "B.Cu")', f'{T}{T}(net "GND")',
+             f'{T}{T}(uuid "g")', f"{T})"]
+    counts = collections.Counter()
+    out = kt.altium_block(block, counts, NO_PLAN)
+    assert out[0] == f"{T}(zone" and counts["copper polygons zoned"] == 1
+    # chords cut at most ARC_SAGITTA_MM into the disc, so at most sagitta x perimeter of area is lost
+    assert len(_pts(out)) > 16 and _area(_pts(out)) == pytest.approx(math.pi, abs=kt.ARC_SAGITTA_MM * 2 * math.pi)
+
+
+def test_keepout_zone_is_left_alone():
+    block = [f"{T}(zone", f'{T}{T}(layer "F.Cu")', f'{T}{T}(uuid "k")', f"{T}{T}(connect_pads", f"{T}{T})",
+             f"{T}{T}(keepout", f"{T}{T}{T}(tracks not_allowed)", f"{T}{T})",
+             f"{T}{T}(polygon", f"{T}{T}{T}(pts", f"{T}{T}{T}{T}(arc", f"{T}{T}{T}{T}{T}(start 1 0)",
+             f"{T}{T}{T}{T}{T}(mid -1 0)", f"{T}{T}{T}{T}{T}(end 1 0)", f"{T}{T}{T}{T})", f"{T}{T}{T})", f"{T}{T})", f"{T})"]
+    assert kt.altium_block(list(block), collections.Counter(), NO_PLAN) == block

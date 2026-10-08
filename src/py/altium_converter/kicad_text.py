@@ -7,6 +7,7 @@ every untouched item byte-identical. Importable by both the uv package and
 the scripts that run under KiCad's own Python.
 """
 import collections
+import math
 import os
 import re
 
@@ -124,6 +125,86 @@ def arc_radius_mm(a, b, c):
     return max(abs(ux), abs(uy), ((ax - ux) ** 2 + (ay - uy) ** 2) ** 0.5)
 
 
+# Altium's importer turns a zone's (min_thickness W) into its polygon "Remove necks when copper width less than W"
+# (0.25 mm -> REMOVENECKS=TRUE, NECKWIDTHTHRESHOLD=9.8425mil). Neck removal works like rolling a disc of that width
+# through the poured copper: under a BGA, with the real ~4 mil plane-to-via clearance, the webs between vias are
+# ~0.11 mm, so 0.25 mm cut the plane away (VCU118: SYS_1V8 under the U60-U62 DDR4 row, 2026-10-07). Allegro has
+# already decided what copper exists; 1 mil keeps every real web and is effectively "off".
+ALTIUM_MIN_THICKNESS_MM = 0.0254
+
+# Altium's importer reads a zone outline's (xy) points and drops its (arc ...) segments: an arc-only outline imports
+# as "0 vertices" (not at all), a mixed one loses its rounded parts. On the VCU118, 412 of the 726 netted copper
+# shapes lost every via they hold -- the PCIe edge GND tabs (pills with a via in each round end: 5.00 -> 3.88 mm2)
+# and 372 GND dots -- and Altium then removed the copper as dead (2026-10-07). So outline arcs are written as points.
+ARC_SAGITTA_MM = 0.0025      # largest gap between an arc and its chords (0.1 mil)
+_N = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+_XY = re.compile(rf"\(xy\s+{_N}\s+{_N}\)")
+_ARC = re.compile(rf"\(arc\s+\(start\s+{_N}\s+{_N}\)\s+\(mid\s+{_N}\s+{_N}\)\s+\(end\s+{_N}\s+{_N}\)\s*\)")
+
+
+def arc_points(start, mid, end, sagitta=ARC_SAGITTA_MM):
+    """Points along the arc start -> mid -> end (start and end exact); start == end is a full circle through mid."""
+    (sx, sy), (mx, my), (ex, ey) = start, mid, end
+    if math.isclose(sx, ex, abs_tol=1e-9) and math.isclose(sy, ey, abs_tol=1e-9):
+        cx, cy = (sx + mx) / 2, (sy + my) / 2
+        span = 2 * math.pi
+    else:
+        d = 2 * (sx * (my - ey) + mx * (ey - sy) + ex * (sy - my))
+        if abs(d) < 1e-12:
+            return [start, end]
+        cx = ((sx*sx + sy*sy) * (my - ey) + (mx*mx + my*my) * (ey - sy) + (ex*ex + ey*ey) * (sy - my)) / d
+        cy = ((sx*sx + sy*sy) * (ex - mx) + (mx*mx + my*my) * (sx - ex) + (ex*ex + ey*ey) * (mx - sx)) / d
+        a0, am, a1 = (math.atan2(y - cy, x - cx) for x, y in (start, mid, end))
+        tau = 2 * math.pi
+        span = (a1 - a0) % tau if (am - a0) % tau < (a1 - a0) % tau else -((a0 - a1) % tau)
+    r = math.hypot(sx - cx, sy - cy)
+    a0 = math.atan2(sy - cy, sx - cx)
+    step = 2 * math.acos(1 - sagitta / r) if r > sagitta else math.pi / 2
+    n = max(2, min(256, math.ceil(abs(span) / step)))
+    pts = [(cx + r * math.cos(a0 + span * i / n), cy + r * math.sin(a0 + span * i / n)) for i in range(n + 1)]
+    pts[0], pts[-1] = start, end
+    return pts
+
+
+def _num(v):
+    s = f"{v:.6f}".rstrip("0").rstrip(".")
+    return "0" if s in ("", "-0") else s
+
+
+def linearize_outline_arcs(lines):
+    """Replace each (arc (start)(mid)(end)) in an outline's pts with (xy) points; return (lines, arcs replaced).
+
+    Arcs may span several lines (KiCad 10 writes start/mid/end on their own lines). A point equal to the one just
+    written (consecutive arcs share ends) is not repeated."""
+    out, arcs, last, k = [], 0, None, 0
+    while k < len(lines):
+        line = lines[k]
+        if line.strip().startswith("(arc"):
+            indent = line[:len(line) - len(line.lstrip())]
+            buf, depth = [line], line.count("(") - line.count(")")
+            while depth > 0:
+                k += 1
+                buf.append(lines[k])
+                depth += lines[k].count("(") - lines[k].count(")")
+            m = _ARC.search(" ".join(b.strip() for b in buf))
+            if not m:
+                raise RuntimeError(f"unreadable outline arc: {' '.join(b.strip() for b in buf)}")
+            v = [float(g) for g in m.groups()]
+            for x, y in arc_points((v[0], v[1]), (v[2], v[3]), (v[4], v[5])):
+                if last is not None and abs(x - last[0]) < 1e-6 and abs(y - last[1]) < 1e-6:
+                    continue
+                out.append(f"{indent}(xy {_num(x)} {_num(y)})")
+                last = (x, y)
+            arcs += 1
+        else:
+            found = _XY.findall(line)
+            if found:
+                last = (float(found[-1][0]), float(found[-1][1]))
+            out.append(line)
+        k += 1
+    return out, arcs
+
+
 def altium_block(block, counts, plan):
     """Rewrite one top-level item for Altium's KiCad importer; return its lines.
 
@@ -139,6 +220,11 @@ def altium_block(block, counts, plan):
       zone_plan priority. Altium's reader predates nets on graphic shapes and
       would import no-net copper.
     - Netless zone Allegro poured nothing into (zone_plan "empty") -> dropped.
+    - Zone min_thickness -> ALTIUM_MIN_THICKNESS_MM, so Altium's re-pour does not neck away plane webs.
+    - Copper zone / zoned gr_poly outline arcs -> points (Altium drops outline arcs; see ARC_SAGITTA_MM).
+    - Copper zone pad connection: KiCad's default (thermal relief) -> solid. kicad-cli writes Allegro's dynamic
+      shapes with KiCad's thermal defaults (0.5 mm gap and spokes), which Altium imports as Relief connects that
+      leave pads in a bare ring between fine-pitch pins; Allegro's fill covers those pads (J6 pins 9/10: 99 %/84 %).
     """
     head = block[0].strip()
     fields = [l.strip() for l in block]
@@ -147,6 +233,20 @@ def altium_block(block, counts, plan):
     if head == "(zone" and uuid in plan["empty"]:
         counts["empty netless zones dropped"] += 1
         return []
+    if head == "(zone":
+        lowered = [f"\t\t(min_thickness {ALTIUM_MIN_THICKNESS_MM:g})" if l.startswith("\t\t(min_thickness ") else l
+                   for l in block]
+        if lowered != block:
+            counts["zone neck widths lowered"] += 1
+        if not any(f.startswith("(keepout") for f in fields):
+            if "\t\t(connect_pads" in lowered:
+                lowered[lowered.index("\t\t(connect_pads")] = "\t\t(connect_pads yes"
+                counts["zone pad connections made solid"] += 1
+            lowered, arcs = linearize_outline_arcs(lowered)
+            if arcs:
+                counts["outline arcs written as points"] += arcs
+                counts["zones with outline arcs"] += 1
+        return lowered
     if head == "(arc":
         pts = {}
         for f in fields:
@@ -164,12 +264,16 @@ def altium_block(block, counts, plan):
             i = fields.index("(pts")
             j = next(k for k in range(i + 1, len(block)) if block[k] == "\t\t)")
             counts["copper polygons zoned"] += 1
+            pts, arcs = linearize_outline_arcs(block[i:j + 1])
+            if arcs:
+                counts["outline arcs written as points"] += arcs
+                counts["zones with outline arcs"] += 1
             return (["\t(zone", f"\t\t{net}", f"\t\t{layer}", f"\t\t{uuid_line}",
                      f"\t\t(priority {plan['priority'][uuid]})", "\t\t(hatch edge 0.5)",
-                     "\t\t(connect_pads yes", "\t\t\t(clearance 0)", "\t\t)", "\t\t(min_thickness 0.25)",
+                     "\t\t(connect_pads yes", "\t\t\t(clearance 0)", "\t\t)", f"\t\t(min_thickness {ALTIUM_MIN_THICKNESS_MM:g})",
                      "\t\t(fill", "\t\t\t(thermal_gap 0.5)", "\t\t\t(thermal_bridge_width 0.5)", "\t\t)",
                      "\t\t(polygon"]
-                    + ["\t" + l for l in block[i:j + 1]]
+                    + ["\t" + l for l in pts]
                     + ["\t\t)", "\t)"])
     return block
 
@@ -200,18 +304,20 @@ def renumber_layers(rows):
 NET_REF = re.compile(r'^(\t+)\(net "((?:[^"\\]|\\.)*)"\)$')
 
 
+def _is_keepout(block):
+    return any(l.strip().startswith("(keepout") for l in block)
+
+
 def pour_order(zones, plan):
-    """Zone blocks in the order Altium should pour them: smallest outline first, netless last.
+    """Zone blocks in the order Altium should POUR them: smallest outline first, netless last.
 
-    Altium's KiCad importer numbers its pour (``POURINDEX``) from the zone ORDER in the file and ignores
-    ``(priority N)`` -- measured on the VCU118: KiCad priorities 31, 12, 30, 44, 23, 54, 18 came out as
-    consecutive pour indices. Allegro lets a split island cut out of the plane around it; in Altium the
-    earlier polygon wins, so a full-layer plane poured first starves every smaller shape inside it
-    (53 polygons lost their copper this way). ``plan["priority"]`` already ranks zones by area with the
-    largest at 0, so smallest-first is descending priority.
+    Allegro lets a split island cut out of the plane around it; in Altium the polygon that pours first
+    wins, so a full-layer plane poured first starves every smaller shape inside it (53 polygons lost
+    their copper this way). ``plan["priority"]`` ranks zones by area with the largest at 0 (KiCad's
+    meaning: the higher number wins), so smallest-first is descending priority. ``altium_priority``
+    writes the resulting rank into the Altium copies.
 
-    Keepout rule areas pour nothing and keep their place at the front. The sort is stable, so ties keep
-    file order.
+    Keepout rule areas pour nothing and sort to the front. The sort is stable, so ties keep file order.
     """
     def uuid(block):
         return next((l.strip().split('"')[1] for l in block if l.strip().startswith("(uuid ")), None)
@@ -224,11 +330,26 @@ def pour_order(zones, plan):
         return True
 
     def key(block):
-        if any(l.strip().startswith("(keepout") for l in block):
+        if _is_keepout(block):
             return (0, False, 0)
         return (1, netless(block), -plan["priority"].get(uuid(block), -1))
 
     return sorted(zones, key=key)
+
+
+def altium_priority(block, rank):
+    """A copper zone block with ``(priority rank)``: its place in ``pour_order``, so the first to pour gets 0.
+
+    Altium's KiCad importer copies ``(priority N)`` straight into the pour order (``POURINDEX``, ascending),
+    and the lowest pour index pours first and wins -- the reverse of KiCad, where the higher priority wins.
+    Measured 2026-10-07 on two VCU118 imports written in opposite file orders: POURINDEX ranked against the
+    zone's priority with Spearman +1.0 both times, against its file position +1.0 and -1.0. With the plan's
+    KiCad priorities (largest zone 0) every full-layer plane poured first and starved the islands in it;
+    file order does nothing.
+    """
+    out = [l for l in block if not l.startswith("\t\t(priority ")]
+    at = next(i for i, l in enumerate(out) if l.startswith("\t\t(uuid "))
+    return out[:at + 1] + [f"\t\t(priority {rank})"] + out[at + 1:]
 # Lines/blocks introduced after KiCad 9 (format 20241229) that it would reject.
 V10_ONLY = ("(duplicate_pad_numbers_are_jumpers ", "(covering", "(plugging", "(capping", "(filling")
 
@@ -282,14 +403,19 @@ def downgrade_to_kicad9(src, dst, plan, keep_fills=True):
                 if body == "\t)":
                     done = altium_block(block, counts, plan)
                     if done and done[0].strip() == "(zone":
-                        zones.append(done)      # held back: written in pour order at the end
+                        zones.append(done)      # held back: written in pour order, ranked, at the end
                     else:
                         yield from done
                     block = None
             elif body == ")" and zones:
+                rank = 0
                 for z in pour_order(zones, plan):
+                    if not _is_keepout(z):
+                        z = altium_priority(z, rank)
+                        rank += 1
                     yield from z
                 counts["zones written in pour order"] = len(zones)
+                counts["copper zones given their pour rank as priority"] = rank
                 zones.clear()
                 yield body
             else:
